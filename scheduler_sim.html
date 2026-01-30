@@ -1,0 +1,912 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>排班策略模擬戰情室 v8.0</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .cell-base { font-size: 0.85rem; font-weight: 700; display: flex; align-items: center; justify-content: center; height: 100%; width: 100%; border-radius: 0.25rem; transition: all 0.2s; cursor: grab; user-select: none; }
+        .cell-base:active { cursor: grabbing; opacity: 0.8; transform: scale(0.95); }
+        .cell-base:hover { opacity: 0.9; box-shadow: 0 1px 2px rgba(0,0,0,0.1); }
+        
+        /* 班別樣式 */
+        .cell-E { background-color: #dbeafe; color: #1e40af; border: 1px solid #93c5fd; }
+        .cell-M { background-color: #fef3c7; color: #92400e; border: 1px solid #fcd34d; }
+        .cell-N { background-color: #bfdbfe; color: #172554; border: 1px solid #60a5fa; }
+        .cell-L { background-color: #e9d5ff; color: #581c87; border: 1px solid #c084fc; }
+        .cell-custom { background-color: #fce7f3; color: #831843; border: 1px solid #fbcfe8; }
+
+        .cell-R_sun, .cell-r { background-color: #dcfce7; color: #166534; border: 1px solid #86efac; }
+        .cell-Leave { background-color: #f3f4f6; color: #6b7280; font-style: italic; border: 2px dashed #9ca3af; }
+        .cell-Empty { background-color: #ffffff; border: 1px dashed #e2e8f0; }
+        
+        /* 選擇器 */
+        .cell-select { 
+            width: 100%; height: 100%; 
+            font-size: 0.75rem; font-weight: 700; text-align: center; 
+            border: 1px solid transparent; border-radius: 0.25rem;
+            cursor: pointer; appearance: none; outline: none;
+            background-color: transparent;
+        }
+        .cell-select:hover { background-color: rgba(0,0,0,0.05); border-color: #cbd5e1; }
+        .cell-select:focus { ring: 2px solid #6366f1; }
+
+        /* 狀態標記 */
+        .status-LOCKED::after { content: ''; position: absolute; top: 1px; right: 1px; width: 4px; height: 4px; background-color: #ef4444; border-radius: 50%; }
+        .status-HISTORY::after { content: ''; position: absolute; top: 1px; right: 1px; width: 4px; height: 4px; background-color: #3b82f6; border-radius: 50%; }
+
+        /* 網格系統 */
+        .grid-container { display: grid; border-top: 1px solid #e5e7eb; border-left: 1px solid #e5e7eb; }
+        .grid-cell { border-right: 1px solid #e5e7eb; border-bottom: 1px solid #e5e7eb; min-height: 44px; padding: 1px; position: relative; display: flex; align-items: center; justify-content: center; }
+        
+        ::-webkit-scrollbar { height: 10px; width: 10px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; }
+        ::-webkit-scrollbar-thumb { background: #c7c7c7; border-radius: 5px; }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 font-sans">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        // --- Scheduler Logic v8.0 ---
+        class Scheduler {
+            constructor(people, fixedNightEmps, manualAssignments, demand, manualHistory, shiftTypes) {
+                this.people = people.filter(p => p.active);
+                this.fixedNightEmps = fixedNightEmps; 
+                this.manualAssignments = manualAssignments; 
+                this.demand = demand; 
+                this.manualHistory = manualHistory; 
+                this.shiftTypes = shiftTypes; 
+
+                this.grid = new Map(); 
+                this.statusGrid = new Map();
+                this.dailyCounts = new Map();
+                this.peopleIds = this.people.map(p => p.empId);
+                
+                this.shiftCodes = this.shiftTypes.map(s => s.code);
+                this.workCodes = this.shiftTypes.filter(s => s.type === 'Work').map(s => s.code);
+                this.offCodes = ["R_sun", "r", "Leave"];
+                
+                this.initGrids();
+            }
+
+            initGrids() {
+                this.people.forEach(p => {
+                    this.grid.set(p.empId, new Map());
+                    this.statusGrid.set(p.empId, new Map());
+                });
+            }
+
+            fmtDate(dateObj) {
+                const year = dateObj.getFullYear();
+                const month = String(dateObj.getMonth() + 1).padStart(2, '0');
+                const day = String(dateObj.getDate()).padStart(2, '0');
+                return `${year}-${month}-${day}`;
+            }
+
+            buildWindow(monthDate) {
+                const y = monthDate.getFullYear();
+                const m = monthDate.getMonth();
+                const endDate = new Date(y, m + 1, 0); 
+                const startDate = new Date(endDate);
+                startDate.setDate(endDate.getDate() - 34); 
+
+                const windowDates = [];
+                const dateKeys = [];
+                for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
+                    const dk = this.fmtDate(d);
+                    windowDates.push({ date: new Date(d), key: dk, day: d.getDay() });
+                    dateKeys.push(dk);
+                    
+                    const countObj = { Off: 0, R_sun: 0, r: 0, Leave: 0 };
+                    this.shiftCodes.forEach(code => countObj[code] = 0);
+                    this.dailyCounts.set(dk, countObj);
+                }
+                return { windowDates, dateKeys };
+            }
+
+            // 初始化：從外部載入現有狀態 (用於填補空缺功能)
+            loadFromState(gridData, countsData) {
+                // 重建 grid
+                gridData.forEach((empData, empId) => {
+                    empData.forEach((code, dateKey) => {
+                        this.grid.get(empId).set(dateKey, code);
+                        // Status grid 在此簡化，設為 EXISTING
+                        this.statusGrid.get(empId).set(dateKey, "EXISTING");
+                    });
+                });
+                // 重建 counts
+                this.dateKeys.forEach(dk => {
+                    const countObj = { Off: 0, R_sun: 0, r: 0, Leave: 0 };
+                    this.shiftCodes.forEach(code => countObj[code] = 0);
+                    
+                    // 掃描 grid 計算
+                    this.peopleIds.forEach(empId => {
+                        const code = this.grid.get(empId).get(dk);
+                        if (code) {
+                            if (countObj[code] !== undefined) countObj[code]++;
+                            if (this.offCodes.includes(code)) countObj.Off++;
+                        }
+                    });
+                    this.dailyCounts.set(dk, countObj);
+                });
+            }
+
+            // 新增功能：只填補空缺
+            fillEmptySlotsOnly() {
+                // 不重置 grid，直接基於現有狀態填補
+                this.fillNightByDemand();
+                this.fillDayByDemand();
+            }
+
+            generate(monthDate) {
+                const { windowDates, dateKeys } = this.buildWindow(monthDate);
+                this.dateKeys = dateKeys;
+                this.windowDates = windowDates;
+
+                this.applyManualHistory();
+                this.applyManualAssignments(); 
+                this.assignStrictQuotaOffs();
+                this.fixStreaks(); 
+                this.applyPerennialNight();
+                this.fillNightByDemand();
+                this.fillDayByDemand();
+
+                return {
+                    windowDates: this.windowDates,
+                    grid: this.grid,
+                    counts: this.dailyCounts,
+                    quotaStats: this.calculateQuotaStats()
+                };
+            }
+
+            setCell(empId, dateKey, code, status) {
+                const oldCode = this.getCell(empId, dateKey);
+                if (oldCode) {
+                    const oldCounts = this.dailyCounts.get(dateKey);
+                    if (oldCounts && oldCounts[oldCode] !== undefined) oldCounts[oldCode]--;
+                    if (oldCounts && this.offCodes.includes(oldCode)) oldCounts.Off--;
+                }
+
+                if (!code) {
+                    this.grid.get(empId).delete(dateKey);
+                    this.statusGrid.get(empId).delete(dateKey);
+                    return;
+                }
+
+                this.grid.get(empId).set(dateKey, code);
+                this.statusGrid.get(empId).set(dateKey, status);
+                
+                const counts = this.dailyCounts.get(dateKey);
+                if (counts) {
+                    if (counts[code] !== undefined) counts[code]++;
+                    if (this.offCodes.includes(code)) counts.Off++;
+                }
+            }
+
+            getCell(empId, dateKey) { return this.grid.get(empId).get(dateKey); }
+
+            applyManualHistory() {
+                if (!this.manualHistory) return;
+                this.peopleIds.forEach(empId => {
+                    const history = this.manualHistory.get(empId);
+                    if (history) {
+                        history.forEach((code, dateKey) => {
+                            if (this.dateKeys.includes(dateKey) && code) {
+                                this.setCell(empId, dateKey, code, "HISTORY");
+                            }
+                        });
+                    }
+                });
+            }
+
+            applyManualAssignments() {
+                if (!this.manualAssignments) return;
+                this.peopleIds.forEach(empId => {
+                    const assigns = this.manualAssignments.get(empId);
+                    if (assigns) {
+                        assigns.forEach((code, dateKey) => {
+                            if (this.dateKeys.includes(dateKey) && code) {
+                                this.setCell(empId, dateKey, code, "LOCKED");
+                            }
+                        });
+                    }
+                });
+            }
+
+            assignStrictQuotaOffs() {
+                const weeks = [];
+                let currentWeek = [];
+                this.windowDates.forEach(d => {
+                    if (d.day === 0 && currentWeek.length > 0) {
+                        weeks.push(currentWeek);
+                        currentWeek = [];
+                    }
+                    currentWeek.push(d);
+                });
+                if (currentWeek.length > 0) weeks.push(currentWeek);
+
+                this.peopleIds.forEach(empId => {
+                    weeks.forEach(week => {
+                        this.tryAssignWeekOff(empId, week, "R_sun", 0, 5); 
+                        this.tryAssignWeekOff(empId, week, "r", 6, 5);     
+                    });
+                });
+
+                this.peopleIds.forEach(empId => {
+                    this.forceFillQuota(empId, "R_sun", 5);
+                    this.forceFillQuota(empId, "r", 5);
+                });
+            }
+
+            tryAssignWeekOff(empId, week, type, preferredDay, limit) {
+                let currentCount = 0;
+                this.dateKeys.forEach(k => { if(this.getCell(empId, k) === type) currentCount++; });
+                if (currentCount >= limit) return;
+
+                const hasTypeInWeek = week.some(d => this.getCell(empId, d.key) === type);
+                if (hasTypeInWeek) return;
+
+                const candidates = week.filter(d => !this.getCell(empId, d.key) && this.canAssignOff(d.key));
+                candidates.sort((a, b) => {
+                    if (a.day === preferredDay) return -1;
+                    if (b.day === preferredDay) return 1;
+                    return this.getDailyLoad(a.key) - this.getDailyLoad(b.key);
+                });
+                if (candidates.length > 0) this.setCell(empId, candidates[0].key, type, "ASSIGNED");
+            }
+
+            forceFillQuota(empId, type, targetCount) {
+                let currentCount = 0;
+                this.dateKeys.forEach(k => { if(this.getCell(empId, k) === type) currentCount++; });
+
+                if (currentCount < targetCount) {
+                    let needed = targetCount - currentCount;
+                    const empties = this.windowDates
+                        .filter(d => !this.getCell(empId, d.key) && this.canAssignOff(d.key))
+                        .sort((a, b) => this.getDailyLoad(a.key) - this.getDailyLoad(b.key));
+                    for (let i = 0; i < needed && i < empties.length; i++) this.setCell(empId, empties[i].key, type, "ASSIGNED");
+                }
+            }
+
+            fixStreaks() {
+                this.peopleIds.forEach(empId => {
+                    for (let i = 0; i <= this.dateKeys.length - 7; i++) {
+                        let hasOff = false;
+                        for (let j = 0; j < 7; j++) {
+                            const code = this.getCell(empId, this.dateKeys[i + j]);
+                            if (this.offCodes.includes(code)) {
+                                hasOff = true;
+                                break;
+                            }
+                        }
+                        if (!hasOff) {
+                            const streakDays = this.dateKeys.slice(i, i+7);
+                            const bestDay = streakDays
+                                .filter(dk => !["LOCKED", "HISTORY"].includes(this.statusGrid.get(empId).get(dk))) 
+                                .sort((a, b) => this.getDailyLoad(a) - this.getDailyLoad(b))[0]; 
+
+                            if (bestDay) this.setCell(empId, bestDay, "r", "ASSIGNED");
+                        }
+                    }
+                });
+            }
+
+            getDailyLoad(dateKey) { return this.dailyCounts.get(dateKey).Off; }
+            
+            canAssignOff(dateKey) {
+                let totalDemand = 0;
+                this.workCodes.forEach(c => totalDemand += (this.demand[c] || 0));
+                const totalPeople = this.people.length;
+                const currentOff = this.dailyCounts.get(dateKey).Off;
+                return (totalPeople - currentOff - 1) >= totalDemand;
+            }
+
+            applyPerennialNight() {
+                this.fixedNightEmps.forEach(empId => {
+                    this.dateKeys.forEach(dk => {
+                        if (!this.getCell(empId, dk)) {
+                            if (this.checkConsecutiveWork(empId, dk)) this.setCell(empId, dk, "L", "LOCKED");
+                        }
+                    });
+                });
+            }
+
+            fillNightByDemand() {
+                this.dateKeys.forEach(dk => {
+                    const counts = this.dailyCounts.get(dk);
+                    let reqN = this.demand['N'] || 0;
+                    
+                    const lCount = counts['L'] || 0;
+                    const nCurrent = counts['N'] || 0;
+                    let needed = Math.max(0, reqN - lCount - nCurrent);
+
+                    this.fillShift(dk, 'N', needed);
+                });
+            }
+
+            fillDayByDemand() {
+                this.dateKeys.forEach(dk => {
+                    const counts = this.dailyCounts.get(dk);
+                    this.workCodes.filter(c => c !== 'N' && c !== 'L').forEach(code => {
+                        let req = this.demand[code] || 0;
+                        let current = counts[code] || 0;
+                        this.fillShift(dk, code, Math.max(0, req - current));
+                    });
+                });
+            }
+
+            fillShift(dateKey, shiftCode, countNeeded) {
+                if (countNeeded <= 0) return;
+                
+                let candidates = this.peopleIds.filter(empId => {
+                    if (this.getCell(empId, dateKey)) return false; 
+                    if (!this.checkConsecutiveWork(empId, dateKey)) return false; 
+                    if (!this.checkRestInterval(empId, dateKey, shiftCode)) return false; 
+                    if (!this.checkNightTransition(empId, dateKey, shiftCode)) return false;
+
+                    if (this.fixedNightEmps.has(empId) && shiftCode !== "N" && shiftCode !== "L") return false;
+                    return true;
+                });
+
+                candidates.sort((a, b) => {
+                    const scoreA = this.countWork(a) * 10 - this.getRotationScore(a, dateKey, shiftCode);
+                    const scoreB = this.countWork(b) * 10 - this.getRotationScore(b, dateKey, shiftCode);
+                    return scoreA - scoreB;
+                });
+
+                for (let i = 0; i < countNeeded && i < candidates.length; i++) {
+                    this.setCell(candidates[i], dateKey, shiftCode, "ASSIGNED");
+                }
+            }
+
+            getRotationScore(empId, dateKey, shiftCode) {
+                const idx = this.dateKeys.indexOf(dateKey);
+                let prevCode = "";
+                if (idx > 0) prevCode = this.getCell(empId, this.dateKeys[idx - 1]);
+                else {
+                     const firstDate = new Date(this.windowDates[0].date);
+                     const prevDate = new Date(firstDate);
+                     prevDate.setDate(firstDate.getDate() - 1);
+                     prevCode = this.manualHistory.get(empId)?.get(this.fmtDate(prevDate));
+                }
+
+                if (!prevCode || this.offCodes.includes(prevCode)) return 0;
+
+                if (prevCode === 'E' && shiftCode === 'E') return 2;
+                if (prevCode === 'E' && shiftCode === 'M') return 3; 
+                if (prevCode === 'M' && shiftCode === 'M') return 2;
+                if (prevCode === 'M' && shiftCode === 'N') return 3; 
+                if (prevCode === 'N' && shiftCode === 'N') return 2;
+                
+                if (prevCode === 'N' && shiftCode === 'E') return -5;
+                if (prevCode === 'N' && shiftCode === 'M') return -2;
+                if (prevCode === 'M' && shiftCode === 'E') return -2;
+
+                return 0;
+            }
+
+            checkNightTransition(empId, dateKey, shiftCode) {
+                if (shiftCode === 'E' || shiftCode === 'M') {
+                    const idx = this.dateKeys.indexOf(dateKey);
+                    let dayMinus2Code = "";
+                    
+                    if (idx >= 2) {
+                        dayMinus2Code = this.getCell(empId, this.dateKeys[idx - 2]);
+                    } else {
+                        return true; 
+                    }
+
+                    if (dayMinus2Code === 'N' || dayMinus2Code === 'L') {
+                        const dayMinus1Code = this.getCell(empId, this.dateKeys[idx - 1]);
+                        if (dayMinus1Code !== 'R_sun' && dayMinus1Code !== 'r') {
+                            return false; 
+                        }
+                    }
+                }
+                return true;
+            }
+
+            checkConsecutiveWork(empId, currentDateKey) {
+                const idx = this.dateKeys.indexOf(currentDateKey);
+                let consecutive = 0;
+                for (let i = 1; i <= 6; i++) {
+                    let code = "";
+                    if (idx - i >= 0) code = this.getCell(empId, this.dateKeys[idx - i]);
+                    else {
+                        const firstDate = new Date(this.windowDates[0].date);
+                        const checkDate = new Date(firstDate);
+                        checkDate.setDate(firstDate.getDate() - (i - idx)); 
+                        code = this.manualHistory.get(empId)?.get(this.fmtDate(checkDate));
+                    }
+                    if (this.isWorkCode(code)) consecutive++; else break;
+                }
+                return consecutive < 6;
+            }
+
+            checkRestInterval(empId, dateKey, nextShift) {
+                const idx = this.dateKeys.indexOf(dateKey);
+                let prevCode = "";
+                let prevDateKey = "";
+                
+                if (idx > 0) {
+                    prevDateKey = this.dateKeys[idx - 1];
+                    prevCode = this.getCell(empId, prevDateKey);
+                } else {
+                    const firstDate = new Date(this.windowDates[0].date);
+                    const prevDate = new Date(firstDate);
+                    prevDate.setDate(firstDate.getDate() - 1);
+                    prevDateKey = this.fmtDate(prevDate);
+                    prevCode = this.manualHistory.get(empId)?.get(prevDateKey);
+                }
+
+                if (!this.workCodes.includes(prevCode)) return true;
+
+                const prevDef = this.shiftTypes.find(s => s.code === prevCode);
+                const nextDef = this.shiftTypes.find(s => s.code === nextShift);
+                if (!prevDef || !nextDef) return true; 
+
+                const tPrevEnd = new Date(`${prevDateKey}T${prevDef.end}:00`);
+                const tPrevStart = new Date(`${prevDateKey}T${prevDef.start}:00`);
+                if (tPrevEnd <= tPrevStart) tPrevEnd.setDate(tPrevEnd.getDate() + 1);
+
+                const tNextStart = new Date(`${dateKey}T${nextDef.start}:00`);
+                const diffMs = tNextStart - tPrevEnd;
+                const diffHours = diffMs / (1000 * 60 * 60);
+
+                return diffHours >= 11;
+            }
+
+            calculateQuotaStats() {
+                const stats = {};
+                this.peopleIds.forEach(empId => {
+                    let rSun = 0, r = 0;
+                    this.dateKeys.forEach(k => {
+                        const c = this.getCell(empId, k);
+                        if (c === "R_sun") rSun++;
+                        if (c === "r") r++;
+                    });
+                    stats[empId] = { R_sun: rSun, r: r };
+                });
+                return stats;
+            }
+
+            isWorkCode(code) { return this.workCodes.includes(code); }
+            isOffCode(code) { return this.offCodes.includes(code); }
+
+            countWork(empId) {
+                let c = 0;
+                this.grid.get(empId).forEach(code => { if(this.workCodes.includes(code)) c++; });
+                return c;
+            }
+        }
+
+        // --- UI ---
+        const App = () => {
+            const [schedule, setSchedule] = React.useState(null);
+            const [shiftTypes, setShiftTypes] = React.useState([
+                { code: 'E', label: '早', start: '07:00', end: '15:00', type: 'Work' },
+                { code: 'M', label: '午', start: '15:00', end: '23:00', type: 'Work' },
+                { code: 'N', label: '夜', start: '23:00', end: '07:00', type: 'Work' },
+                { code: 'L', label: '常夜', start: '23:00', end: '07:00', type: 'Work' },
+            ]);
+            
+            const [demandConfig, setDemandConfig] = React.useState({ E: 1, M: 1, N: 1, L: 0 });
+            const [staffCount, setStaffCount] = React.useState(6);
+            
+            const [currentMonth, setCurrentMonth] = React.useState(() => {
+                const now = new Date();
+                return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+            });
+
+            const [manualHistory, setManualHistory] = React.useState(new Map()); 
+            const [historyRange, setHistoryRange] = React.useState([]); 
+            const [fixedNightEmps, setFixedNightEmps] = React.useState(new Set(["EMP1"])); 
+            const [manualAssignments, setManualAssignments] = React.useState(new Map());
+            const [windowDates, setWindowDates] = React.useState([]);
+
+            const [isAddingShift, setIsAddingShift] = React.useState(false);
+            const [newShift, setNewShift] = React.useState({ code: '', label: '', start: '09:00', end: '18:00' });
+
+            const shiftOptions = [...shiftTypes.map(s => s.code), "R_sun", "r", "Leave", ""];
+
+            React.useEffect(() => {
+                const year = parseInt(currentMonth.split("-")[0]);
+                const month = parseInt(currentMonth.split("-")[1]) - 1;
+                const targetMonthStart = new Date(year, month, 1);
+                
+                const hRange = [];
+                for (let i = 6; i > 0; i--) {
+                    const d = new Date(targetMonthStart);
+                    d.setDate(d.getDate() - i);
+                    hRange.push({
+                        date: new Date(d),
+                        key: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`,
+                        day: d.getDay()
+                    });
+                }
+                setHistoryRange(hRange);
+
+                const lastDay = new Date(year, month + 1, 0);
+                const startDate = new Date(lastDay);
+                startDate.setDate(lastDay.getDate() - 34);
+                
+                const wDates = [];
+                for (let d = new Date(startDate); d <= lastDay; d.setDate(d.getDate() + 1)) {
+                    wDates.push({
+                        date: new Date(d),
+                        key: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`,
+                        day: d.getDay()
+                    });
+                }
+                setWindowDates(wDates);
+                setManualHistory(new Map());
+                setManualAssignments(new Map());
+                setSchedule(null);
+
+            }, [currentMonth]);
+
+            const handleHistoryChange = (empIndex, dateKey, value) => {
+                const empId = `EMP${empIndex + 1}`;
+                const newMap = new Map(manualHistory);
+                if (!newMap.has(empId)) newMap.set(empId, new Map());
+                newMap.get(empId).set(dateKey, value);
+                setManualHistory(newMap);
+            };
+
+            const handleManualAssign = (empIndex, dateKey, value) => {
+                const empId = `EMP${empIndex + 1}`;
+                const newMap = new Map(manualAssignments);
+                if (!newMap.has(empId)) newMap.set(empId, new Map());
+                newMap.get(empId).set(dateKey, value);
+                setManualAssignments(newMap);
+            };
+
+            const toggleFixedNight = (empId) => {
+                const newSet = new Set(fixedNightEmps);
+                if (newSet.has(empId)) newSet.delete(empId);
+                else newSet.add(empId);
+                setFixedNightEmps(newSet);
+            };
+            
+            const handleAddShift = (e) => {
+                e.preventDefault(); 
+                const { code, label, start, end } = newShift;
+                if (!code || !label) {
+                    alert("請輸入代碼與名稱");
+                    return;
+                }
+                if (shiftTypes.find(s => s.code === code) || ["R_sun", "r", "Leave", ""].includes(code)) {
+                    alert("該代碼已存在或為保留字，請更換。");
+                    return;
+                }
+                const updatedTypes = [...shiftTypes, { code, label, start, end, type: 'Work' }];
+                setShiftTypes(updatedTypes);
+                setDemandConfig(prev => ({...prev, [code]: 0}));
+                setNewShift({ code: '', label: '', start: '09:00', end: '18:00' });
+                setIsAddingShift(false);
+            };
+            
+            const removeShiftType = (code) => {
+                if (['E','M','N','L'].includes(code)) { alert("預設班別不可刪除。"); return; }
+                setShiftTypes(shiftTypes.filter(s => s.code !== code));
+                const newDemand = {...demandConfig};
+                delete newDemand[code];
+                setDemandConfig(newDemand);
+            };
+
+            const handleRun = () => {
+                const year = parseInt(currentMonth.split("-")[0]);
+                const month = parseInt(currentMonth.split("-")[1]) - 1;
+                const targetDate = new Date(year, month, 1);
+
+                const people = Array.from({ length: staffCount }, (_, i) => ({
+                    empId: `EMP${i + 1}`,
+                    name: `專員 ${String.fromCharCode(65 + i)}`,
+                    active: true
+                }));
+
+                const scheduler = new Scheduler(people, fixedNightEmps, manualAssignments, demandConfig, manualHistory, shiftTypes);
+                const result = scheduler.generate(targetDate);
+                updateScheduleState(result, people, scheduler);
+            };
+
+            // 新增: 填補空缺按鈕功能
+            const handleFillEmpty = () => {
+                if (!schedule) return;
+                
+                const people = Array.from({ length: staffCount }, (_, i) => ({
+                    empId: `EMP${i + 1}`,
+                    name: `專員 ${String.fromCharCode(65 + i)}`,
+                    active: true
+                }));
+
+                const scheduler = schedule.rawScheduler;
+                // 執行只補空缺
+                scheduler.fillEmptySlotsOnly();
+                
+                // 更新狀態
+                updateScheduleState({
+                    windowDates: schedule.dates,
+                    grid: scheduler.grid,
+                    counts: scheduler.dailyCounts,
+                    quotaStats: scheduler.calculateQuotaStats()
+                }, people, scheduler);
+            };
+
+            const updateScheduleState = (result, people, scheduler) => {
+                const gridData = people.map(p => ({
+                    ...p,
+                    shifts: result.windowDates.map(d => ({
+                        dateKey: d.key,
+                        code: result.grid.get(p.empId).get(d.key) || "",
+                        day: d.day,
+                        status: scheduler.statusGrid.get(p.empId).get(d.key)
+                    })),
+                    quota: result.quotaStats[p.empId]
+                }));
+                setSchedule({ dates: result.windowDates, grid: gridData, counts: result.counts, rawGrid: result.grid, rawScheduler: scheduler });
+            };
+
+            // Drag and Drop Handlers
+            const handleDragStart = (e, empId, dateKey, code) => {
+                e.dataTransfer.setData("text/plain", JSON.stringify({ empId, dateKey, code }));
+                e.dataTransfer.effectAllowed = "move";
+            };
+
+            const handleDragOver = (e) => {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = "move";
+            };
+
+            const handleDrop = (e, targetEmpId, targetDateKey) => {
+                e.preventDefault();
+                const sourceData = JSON.parse(e.dataTransfer.getData("text/plain"));
+                const { empId: sourceEmpId, dateKey: sourceDateKey, code: sourceCode } = sourceData;
+
+                if (sourceEmpId === targetEmpId && sourceDateKey === targetDateKey) return;
+
+                const targetCode = schedule.rawGrid.get(targetEmpId).get(targetDateKey);
+                const scheduler = schedule.rawScheduler;
+                scheduler.setCell(sourceEmpId, sourceDateKey, targetCode, "MANUAL"); 
+                scheduler.setCell(targetEmpId, targetDateKey, sourceCode, "MANUAL"); 
+
+                const updatedCounts = scheduler.dailyCounts;
+                const updatedStats = scheduler.calculateQuotaStats();
+                
+                const people = Array.from({ length: staffCount }, (_, i) => ({
+                    empId: `EMP${i + 1}`,
+                    name: `專員 ${String.fromCharCode(65 + i)}`,
+                    active: true
+                }));
+                
+                updateScheduleState({
+                    windowDates: schedule.dates,
+                    grid: scheduler.grid,
+                    counts: updatedCounts,
+                    quotaStats: updatedStats
+                }, people, scheduler);
+            };
+
+            // 新增: 雙擊清除
+            const handleDoubleClick = (empId, dateKey) => {
+                const scheduler = schedule.rawScheduler;
+                scheduler.setCell(empId, dateKey, "", "MANUAL"); // 清空
+
+                const updatedCounts = scheduler.dailyCounts;
+                const updatedStats = scheduler.calculateQuotaStats();
+                
+                const people = Array.from({ length: staffCount }, (_, i) => ({
+                    empId: `EMP${i + 1}`,
+                    name: `專員 ${String.fromCharCode(65 + i)}`,
+                    active: true
+                }));
+                
+                updateScheduleState({
+                    windowDates: schedule.dates,
+                    grid: scheduler.grid,
+                    counts: updatedCounts,
+                    quotaStats: updatedStats
+                }, people, scheduler);
+            };
+
+            const exportExcel = () => {
+                if (!schedule) { alert("請先執行運算。"); return; }
+                let csvContent = "\uFEFF";
+                const dateHeaders = schedule.dates.map(d => `${d.key.slice(5)}(${"日一二三四五六"[d.day]})`).join(",");
+                csvContent += `人員,${dateHeaders},R_sun統計,r統計\n`;
+                schedule.grid.forEach(person => {
+                    const row = [];
+                    row.push(person.name);
+                    person.shifts.forEach(s => {
+                        const label = s.code === 'Leave' ? '假' : (shiftTypes.find(t => t.code === s.code)?.label || s.code) || "";
+                        row.push(label);
+                    });
+                    row.push(person.quota.R_sun);
+                    row.push(person.quota.r);
+                    csvContent += row.join(",") + "\n";
+                });
+                const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement("a");
+                link.setAttribute("href", url);
+                link.setAttribute("download", `排班表_${currentMonth}.csv`);
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            };
+            
+            const gridTemplate = `140px repeat(${windowDates.length}, 42px) 80px 80px`;
+
+            return (
+                <div className="max-w-[98%] mx-auto p-4 md:p-6 font-sans">
+                    <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6 mb-6">
+                        <div className="flex justify-between items-center mb-6">
+                            <div>
+                                <h1 className="text-2xl font-bold text-slate-800">排班策略戰情室 v8.0</h1>
+                                <p className="text-slate-500 text-sm mt-1">智慧協作：雙擊清除 (取消排班) + 填補空缺 (智慧補班)</p>
+                            </div>
+                            <div className="flex items-center gap-4">
+                                <div className="flex items-center gap-2">
+                                    <label className="text-sm font-bold text-slate-600">目標月份</label>
+                                    <input type="month" value={currentMonth} onChange={(e) => setCurrentMonth(e.target.value)} className="border border-slate-300 rounded px-2 py-1 text-sm"/>
+                                </div>
+                                <button onClick={handleRun} className="bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-2 rounded-lg font-bold shadow-sm transition-all active:scale-95">
+                                    開始運算
+                                </button>
+                                {/* 新增填補按鈕 */}
+                                <button 
+                                    onClick={handleFillEmpty} 
+                                    disabled={!schedule}
+                                    className={`px-4 py-2 rounded-lg font-bold shadow-sm transition-all border ${schedule ? 'bg-orange-500 text-white hover:bg-orange-600 border-orange-500' : 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'}`}
+                                >
+                                    填補空缺
+                                </button>
+                                <button onClick={exportExcel} className={`px-4 py-2 rounded-lg font-bold shadow-sm transition-all border ${schedule ? 'bg-green-600 text-white hover:bg-green-700 border-green-600' : 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'}`}>
+                                    匯出 Excel
+                                </button>
+                            </div>
+                        </div>
+
+                        {/* 設定區塊 (班別/歷史/人力) 省略細節保持不變 */}
+                        <div className="grid grid-cols-1 xl:grid-cols-2 gap-6 mb-6">
+                            <div className="bg-white p-4 rounded-lg border border-slate-200 shadow-sm">
+                                <div className="flex justify-between items-center mb-3 border-b pb-2">
+                                    <h3 className="text-sm font-bold text-slate-700">班別管理</h3>
+                                    <button onClick={() => setIsAddingShift(!isAddingShift)} className="text-xs bg-indigo-50 text-indigo-600 px-2 py-1 rounded hover:bg-indigo-100 font-bold">{isAddingShift ? '取消' : '+ 新增班別'}</button>
+                                </div>
+                                {isAddingShift && (
+                                    <div className="mb-3 p-2 bg-indigo-50 rounded border border-indigo-100 flex flex-wrap gap-2 items-end shadow-inner">
+                                        <div><label className="block text-[10px] text-indigo-600 font-bold">代碼</label><input type="text" placeholder="D" className="w-10 text-xs border rounded p-1" value={newShift.code} onChange={e => setNewShift({...newShift, code: e.target.value.toUpperCase()})} /></div>
+                                        <div><label className="block text-[10px] text-indigo-600 font-bold">名稱</label><input type="text" placeholder="日" className="w-10 text-xs border rounded p-1" value={newShift.label} onChange={e => setNewShift({...newShift, label: e.target.value})} /></div>
+                                        <div><label className="block text-[10px] text-indigo-600 font-bold">時間 (24h)</label><div className="flex items-center gap-1"><input type="time" className="w-20 text-xs border rounded p-1" value={newShift.start} onChange={e => setNewShift({...newShift, start: e.target.value})} /><span className="text-xs text-indigo-400">~</span><input type="time" className="w-20 text-xs border rounded p-1" value={newShift.end} onChange={e => setNewShift({...newShift, end: e.target.value})} /></div></div>
+                                        <button onClick={handleAddShift} className="text-xs bg-indigo-600 text-white px-3 py-1 rounded hover:bg-indigo-700 ml-auto shadow-sm">確認</button>
+                                    </div>
+                                )}
+                                <div className="space-y-2 max-h-48 overflow-y-auto pr-2">
+                                    {shiftTypes.map((s, idx) => (
+                                        <div key={s.code} className="flex items-center justify-between text-sm bg-slate-50 p-1.5 rounded border border-slate-100">
+                                            <div className="flex items-center gap-2">
+                                                <span className={`w-8 h-6 flex items-center justify-center rounded text-xs font-bold ${['E','M','N','L'].includes(s.code)?'text-white':'text-slate-700 bg-white border'}`} style={{ backgroundColor: s.code==='E'?'#2563eb':s.code==='M'?'#ca8a04':s.code==='N'?'#bfdbfe':s.code==='L'?'#e9d5ff':'' }}>
+                                                    <span style={{ color: ['N','L'].includes(s.code) ? (s.code==='N'?'#172554':'#581c87') : 'inherit' }}>{s.label}</span>
+                                                </span>
+                                                <span className="text-xs font-mono text-slate-400">({s.code})</span>
+                                            </div>
+                                            <div className="flex items-center gap-1">
+                                                <input type="time" value={s.start} onChange={e => {const newTypes=[...shiftTypes];newTypes[idx].start=e.target.value;setShiftTypes(newTypes)}} className="border rounded px-1 py-0.5 text-xs w-20 bg-white"/>
+                                                <span className="text-slate-400">~</span>
+                                                <input type="time" value={s.end} onChange={e => {const newTypes=[...shiftTypes];newTypes[idx].end=e.target.value;setShiftTypes(newTypes)}} className="border rounded px-1 py-0.5 text-xs w-20 bg-white"/>
+                                                {!['E','M','N','L'].includes(s.code) && (<button onClick={() => removeShiftType(s.code)} className="ml-2 text-red-400 hover:text-red-600 font-bold px-1">×</button>)}
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                            <div className="bg-slate-50 p-4 rounded-lg border border-slate-200 overflow-x-auto">
+                                <h3 className="text-sm font-bold text-slate-600 mb-3 flex items-center gap-2"><span className="w-2 h-2 bg-blue-500 rounded-full"></span>前置資料 (目標月份前6日)</h3>
+                                <div className="min-w-max">
+                                    <div className="flex border-b border-slate-200 pb-2 mb-2">
+                                        <div className="w-20 font-bold text-xs text-slate-400 pl-2">人員設定</div>
+                                        {historyRange.map(d => (<div key={d.key} className="w-10 text-center text-xs font-bold text-slate-500 flex flex-col"><span>{d.key.slice(8)}</span><span className={d.day===0?'text-red-500':d.day===6?'text-yellow-600':''}>{"日一二三四五六"[d.day]}</span></div>))}
+                                    </div>
+                                    {Array.from({ length: staffCount }).map((_, i) => {
+                                        const empId = `EMP${i+1}`;
+                                        const isFixedNight = fixedNightEmps.has(empId);
+                                        return (
+                                            <div key={i} className="flex items-center mb-1 bg-white rounded p-1 shadow-sm border border-slate-100">
+                                                <div className="w-20 flex items-center gap-2 pr-2"><span className="text-xs font-bold text-slate-600">EMP{i+1}</span><button onClick={() => toggleFixedNight(empId)} className={`text-[10px] px-1.5 py-0.5 rounded border ${isFixedNight ? 'bg-purple-600 text-white border-purple-600' : 'bg-slate-100 text-slate-400 border-slate-200'}`} title="設為固定大夜">{isFixedNight ? '夜' : '輪'}</button></div>
+                                                {historyRange.map(d => {
+                                                    const val = manualHistory.get(empId)?.get(d.key) || "";
+                                                    return (<div key={d.key} className="w-10 px-0.5"><select value={val} onChange={(e) => handleHistoryChange(i, d.key, e.target.value)} className={`cell-select ${val ? `cell-${val}` : 'bg-white border-slate-300'}`}><option value="">-</option>{shiftOptions.map(opt => opt && <option key={opt} value={opt}>{opt === 'Leave' ? '假' : (shiftTypes.find(s=>s.code===opt)?.label || opt)}</option>)}</select></div>);
+                                                })}
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="flex flex-wrap gap-6 items-center bg-slate-50 p-4 rounded-lg border border-slate-200 mb-6">
+                            <div className="flex items-center gap-4 border-r border-slate-300 pr-6"><label className="text-xs font-bold text-slate-500 uppercase tracking-wider">人力配置</label><div className="flex items-center gap-3"><input type="range" min="4" max="20" value={staffCount} onChange={(e) => setStaffCount(parseInt(e.target.value))} className="w-32 h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"/><span className="text-xl font-bold text-indigo-600 w-8 text-center">{staffCount}</span></div></div>
+                            <div className="flex items-center gap-4 flex-wrap"><span className="text-xs font-bold text-slate-500 uppercase">每日需求</span>{shiftTypes.filter(s => s.type === 'Work').map(s => (<div key={s.code} className="flex items-center"><span className={`w-6 h-6 flex items-center justify-center rounded text-xs font-bold mr-1 ${['E','M','N','L'].includes(s.code) ? 'text-white' : 'bg-white border text-slate-600'}`} style={{ backgroundColor: s.code==='E'?'#2563eb':s.code==='M'?'#ca8a04':s.code==='N'?'#bfdbfe':s.code==='L'?'#e9d5ff':'' }}><span style={{ color: ['N','L'].includes(s.code) ? (s.code==='N'?'#172554':'#581c87') : 'inherit' }}>{s.label}</span></span><input type="number" min="0" max="10" value={demandConfig[s.code]||0} onChange={(e) => setDemandConfig({...demandConfig, [s.code]: parseInt(e.target.value)})} className="w-12 text-center font-bold text-slate-700 border rounded py-0.5 text-sm"/></div>))}</div>
+                        </div>
+
+                        <div className="bg-orange-50 rounded-xl border border-orange-100 overflow-hidden mb-6">
+                            <div className="px-4 py-2 bg-orange-100/50 border-b border-orange-200 flex items-center gap-2"><span className="text-lg">📍</span><h3 className="text-sm font-bold text-orange-900">指定排班 / 排休 (鎖定)</h3></div>
+                            <div className="overflow-x-auto"><div className="min-w-max">
+                                <div className="grid-container bg-orange-50/50" style={{ gridTemplateColumns: gridTemplate }}><div className="grid-cell font-bold text-xs text-orange-900/60 sticky left-0 bg-orange-50 z-10">人員</div>{windowDates.map(d => (<div key={d.key} className="grid-cell flex flex-col gap-0.5"><span className="text-[10px] font-bold text-orange-900/70">{d.key.slice(8)}</span><span className={`text-[9px] font-bold ${d.day===0?'text-red-500':d.day===6?'text-orange-600':'text-orange-400'}`}>{"日一二三四五六"[d.day]}</span></div>))}<div className="grid-cell"></div><div className="grid-cell"></div></div>
+                                {Array.from({ length: staffCount }).map((_, i) => {
+                                    const empId = `EMP${i+1}`;
+                                    return (<div key={i} className="grid-container" style={{ gridTemplateColumns: gridTemplate }}><div className="grid-cell text-xs font-bold text-orange-900 sticky left-0 bg-orange-50 z-10 border-r border-orange-200">EMP{i+1}</div>{windowDates.map(d => {const val = manualAssignments.get(empId)?.get(d.key) || "";return (<div key={d.key} className="grid-cell px-0.5 bg-white"><select value={val} onChange={(e) => handleManualAssign(i, d.key, e.target.value)} className={`cell-select ${val ? `cell-${val}` : 'text-slate-300'}`}><option value="">-</option>{shiftOptions.map(opt => opt && <option key={opt} value={opt}>{opt === 'Leave' ? '假' : (shiftTypes.find(s=>s.code===opt)?.label || opt)}</option>)}</select></div>);})}<div className="grid-cell"></div><div className="grid-cell"></div></div>);
+                                })}
+                            </div></div>
+                        </div>
+
+                        {schedule && (
+                            <div className="bg-white rounded-xl shadow-lg border border-slate-200 overflow-hidden">
+                                <div className="px-4 py-2 bg-slate-50 border-b border-slate-200"><h3 className="text-sm font-bold text-slate-700">運算結果 (雙擊清除 / 拖曳調整)</h3></div>
+                                <div className="overflow-x-auto pb-4"><div className="min-w-max">
+                                    <div className="grid-container bg-slate-50" style={{ gridTemplateColumns: gridTemplate }}>
+                                        <div className="grid-cell font-bold text-xs text-slate-500 sticky left-0 bg-slate-100 z-20">人員</div>
+                                        {schedule.dates.map((d, i) => (<div key={i} className={`grid-cell flex flex-col gap-0.5 ${d.day===0 ? 'bg-green-50/60' : d.day===6 ? 'bg-green-50/40' : ''}`}><span className="font-bold text-[10px] text-slate-700">{d.key.slice(8)}</span><span className={`text-[9px] font-bold ${d.day===0?'text-green-600':d.day===6?'text-green-600':'text-slate-400'}`}>{"日一二三四五六"[d.day]}</span></div>))}
+                                        <div className="grid-cell font-bold text-xs text-green-700 bg-green-50">R_sun</div><div className="grid-cell font-bold text-xs text-green-700 bg-green-50">r</div>
+                                    </div>
+                                    {schedule.grid.map((person) => (
+                                        <div key={person.empId} className="grid-container hover:bg-slate-50 transition-colors" style={{ gridTemplateColumns: gridTemplate }}>
+                                            <div className="grid-cell text-sm font-semibold text-slate-700 flex flex-col justify-center sticky left-0 bg-white z-20 border-r border-slate-200"><span>{person.name}</span>{fixedNightEmps.has(person.empId) && <span className="text-[9px] text-purple-600 font-bold bg-purple-50 px-1 rounded w-fit mt-0.5">常夜人員</span>}</div>
+                                            {person.shifts.map((s, colIdx) => {
+                                                const displayLabel = s.code === 'Leave' ? '假' : (shiftTypes.find(t=>t.code===s.code)?.label || s.code);
+                                                return (
+                                                    <div 
+                                                        key={colIdx} 
+                                                        className={`grid-cell p-0.5 ${s.day===0||s.day===6 ? 'bg-slate-50/30' : ''}`}
+                                                        draggable={!!s.code}
+                                                        onDragStart={(e) => handleDragStart(e, person.empId, s.dateKey, s.code)}
+                                                        onDragOver={handleDragOver}
+                                                        onDrop={(e) => handleDrop(e, person.empId, s.dateKey)}
+                                                        onDoubleClick={() => handleDoubleClick(person.empId, s.dateKey)}
+                                                        title="雙擊清除 / 拖曳交換"
+                                                    >
+                                                        <div className={`cell-base ${s.code ? (['E','M','N','L'].includes(s.code) ? `cell-${s.code}` : 'cell-custom') : 'cell-Empty'} status-${s.status}`}>
+                                                            {displayLabel}
+                                                        </div>
+                                                    </div>
+                                                );
+                                            })}
+                                            <div className={`grid-cell font-bold text-sm ${person.quota.R_sun === 5 ? 'text-green-600 bg-green-50' : 'text-red-600 bg-red-50'}`}>{person.quota.R_sun}/5</div>
+                                            <div className={`grid-cell font-bold text-sm ${person.quota.r === 5 ? 'text-green-600 bg-green-50' : 'text-red-600 bg-red-50'}`}>{person.quota.r}/5</div>
+                                        </div>
+                                    ))}
+                                    <div className="grid-container border-t-4 border-slate-100 bg-slate-50" style={{ gridTemplateColumns: gridTemplate }}>
+                                        <div className="grid-cell text-xs font-bold text-red-600 sticky left-0 bg-slate-50 z-20 border-r border-slate-200">每日缺口</div>
+                                        {schedule.dates.map((d, i) => {
+                                            const counts = schedule.counts.get(d.key);
+                                            const missing = [];
+                                            shiftTypes.filter(s => s.type === 'Work').forEach(s => {
+                                                let demand = demandConfig[s.code] || 0;
+                                                let current = counts[s.code] || 0;
+                                                if (s.code === 'N') { const lCount = counts['L'] || 0; if (current + lCount < demand) missing.push({label: '夜', count: demand - (current + lCount)}); } 
+                                                else if (current < demand) { missing.push({label: s.label, count: demand - current}); }
+                                            });
+                                            const isOK = missing.length === 0;
+                                            return (<div key={i} className="grid-cell flex flex-col items-center justify-center p-0.5">{isOK ? (<div className="w-1 h-1 bg-slate-300 rounded-full"></div>) : (missing.map((m, idx) => (<span key={idx} className="text-[10px] font-extrabold text-red-600 leading-tight whitespace-nowrap">缺 {m.label}:{m.count}</span>)))}</div>);
+                                        })}
+                                        <div className="grid-cell bg-slate-50"></div><div className="grid-cell bg-slate-50"></div>
+                                    </div>
+                                </div></div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
